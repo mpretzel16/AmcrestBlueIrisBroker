@@ -1,0 +1,181 @@
+# !/usr/bin/env python3
+# Copyright 2022 Michael Pretzel | Pretzel Bytes LLC
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+#  in the Software without restriction, including without limitation the rights
+#  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is furnished
+#  to do so, subject to the following conditions:
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+# OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+import threading
+import time
+from datetime import datetime
+import urllib.parse
+import requests
+from pyftpdlib import servers
+from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.authorizers import DummyAuthorizer
+import os
+import yaml
+from paho.mqtt import client as mqtt_client
+from blue_iris_client import BlueIrisClient
+
+class BITrigger():
+    use_mqtt = False
+    mqtt_conn: mqtt_client.Client
+    mqtt_topic = "BlueIris/admin"
+    use_api = False
+    use_secure = False
+    bi_client: BlueIrisClient
+    str_nonsecure_url = None
+    def __init__(self, dict_bi_config: dict):
+        use_mqtt = False
+        use_api = False
+        if 'mqtt' in dict_bi_config:
+            use_mqtt = True
+        elif 'api' in dict_bi_config:
+            use_api = True
+        else:
+            exit(1)
+        if use_mqtt:
+            self.use_mqtt = True
+            mqtt = dict_bi_config['mqtt']
+            broker = mqtt['server']
+            port = mqtt['port']
+            client = 'AmcrestBlueIrisBroker'
+            if 'user' in mqtt and 'password' in mqtt:
+                username = mqtt['user']
+                password = mqtt['password']
+            else:
+                username = None
+                password = None
+            self.mqtt_conn = self.connect_mqtt(client, username, password, broker, port)
+        elif use_api:
+            self.use_api = True
+            api = dict_bi_config['api']
+            if api['use_secure_session_keys']:
+                self.use_secure = True
+                bi_client = BlueIrisClient("{protocol}://{server}:{port}"
+                                           .format(protocol=api['protocol'],
+                                                   server=api['server'],
+                                                   port=api['port']),
+                                           api['user'],
+                                           api['password'])
+                self.bi_client = bi_client
+            else:
+                username = api['user']
+                password = api['password']
+                username = urllib.parse.quote(username)
+                password = urllib.parse.quote(password)
+                url = "{protocol}://{username}:{password}@{server}:{port}" \
+                    .format(username=username,
+                            password=password,
+                            protocol=api['protocol'],
+                            server=api['server'],
+                            port=api['port'])
+                self.str_nonsecure_url = url
+
+    def connect_mqtt(self, client_id, username, password, broker, port):
+        print("Conn")
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                print("Connected to MQTT Broker!")
+            else:
+                print("Failed to connect, return code %d\n", rc)
+
+        # Set Connecting Client ID
+        client = mqtt_client.Client(client_id)
+        if not username is None and not password is None:
+            print("pass")
+            client.username_pw_set(username, password)
+        client.on_connect = on_connect
+        client.connect(broker, port)
+        return client
+
+    def publish(self, client, topic, msg):
+        result = client.publish(topic, msg)
+        status = result[0]
+        if status == 0:
+            print(f"Send `{msg}` to topic `{topic}`")
+        else:
+            print(f"Failed to send message to topic {topic}")
+
+    def trigger(self, bi_camera_name: str):
+        if self.use_mqtt:
+            self.publish(self.mqtt_conn,
+                         self.mqtt_topic,
+                         "camera={cameraName}&trigger".format(cameraName=bi_camera_name))
+        elif self.use_api:
+            if self.use_secure:
+                print("BI Trigger")
+                t = self.bi_client.send_bi_json_command({"cmd": "trigger",
+                                                         "session": self.bi_client.str_session_id,
+                                                         "camera": bi_camera_name,
+                                                         "memo": "Trigger from Amcrest Camera"})
+            else:
+                requests.get("{url}/admin?camera={camera}&trigger&memo={memo}"
+                             .format(url=self.str_nonsecure_url,
+                                     camera=bi_camera_name, memo="Trigger from Amcrest Camera"))
+
+
+class CustomFTPHandler(FTPHandler):
+    dict_current_alerting = {}
+    def on_file_received(self, file: str):
+        def process_request():
+            if file.endswith(".jpg") or file.endswith(".jpeg"):
+                image_directory = '{}\image_dir'.format(script_dir)
+                new_file = file.replace(image_directory, '')
+                if "\\" in new_file:
+                    camera_name = new_file.split("\\")[1]
+                else:
+                    camera_name = new_file.split("/")[1]
+                print(camera_name)
+                dict_camera = dict_cameras[camera_name]
+                if camera_name in self.dict_current_alerting:
+                    alert_time = self.dict_current_alerting[camera_name]
+                    if datetime.utcnow().timestamp() >= alert_time + dict_camera['retrigger_time']:
+                        bi_trigger.trigger(dict_camera['bi_camera_name'])
+                else:
+                    self.dict_current_alerting[camera_name] = datetime.utcnow().timestamp()
+                    bi_trigger.trigger(dict_camera['bi_camera_name'])
+                print(self.dict_current_alerting)
+            self.add_channel()
+
+        self.del_channel()
+        threading.Thread(target=process_request).start()
+
+if __name__ == '__main__':
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    dict_config_info = {}
+    dict_cameras = {}
+    with open("config.yml", "r") as stream:
+        try:
+            dict_config_info = yaml.safe_load(stream)
+        except yaml.YAMLError as exc:
+            print(exc)
+
+    bi_trigger = BITrigger(dict_config_info['BlueIrisConfig'])
+    dict_cameras = dict_config_info['cameras']
+    authorizer = DummyAuthorizer()
+    if not dict_config_info['ftp_server']['use_anonymous_user']:
+        for user in dict_config_info['ftp_server']['users']:
+            user = user['user']
+            authorizer.add_user(user['username'], user['password'], '{}/image_dir'.format(script_dir), perm='elradfmwMT')
+    else:
+        authorizer.add_anonymous('{}/image_dir'.format(script_dir), perm='elradfmwMT')
+    address = (dict_config_info['ftp_server']['listen_address'],
+               dict_config_info['ftp_server']['listen_port'])
+    handler = CustomFTPHandler
+    handler.authorizer = authorizer
+    server = servers.FTPServer(address, handler)
+    server.serve_forever()
+
+
