@@ -27,6 +27,7 @@ import os
 import yaml
 from paho.mqtt import client as mqtt_client
 from blue_iris_client import BlueIrisClient
+from loguru import logger
 
 class BITrigger():
     use_mqtt = False
@@ -152,30 +153,150 @@ class CustomFTPHandler(FTPHandler):
         self.del_channel()
         threading.Thread(target=process_request).start()
 
+
+def check_configuration(dict_config):
+    print(dict_config)
+    try:
+        bool_error = False
+        if 'cameras' in dict_config:
+            if len(dict_config['cameras']) > 0:
+                for camera in dict_config['cameras']:
+                    if not 'bi_camera_name' in dict_config['cameras'][camera]:
+                        logger.error("bi_camera_name not in cameras.{}".format(camera))
+                        bool_error = True
+                    if not 'retrigger_time' in dict_config['cameras'][camera]:
+                        logger.error("retrigger_time not in cameras.{}".format(camera))
+                        bool_error = True
+            else:
+                logger.error("cameras does not contain any cameras")
+                bool_error = True
+        else:
+            logger.error("cameras is required in config.yml")
+            bool_error = True
+
+        if 'blue_iris_config' in dict_config:
+            if not 'mqtt' in dict_config['blue_iris_config'] and\
+                    not 'api' in dict_config['blue_iris_config']:
+                logger.error("Either mqtt or api required within blue_iris_config in config.yml")
+                bool_error = True
+            else:
+                if 'mqtt' in dict_config['blue_iris_config'] and \
+                        'api' in dict_config['blue_iris_config']:
+                    logger.warning("mqtt and api exist within blue_iris_config in config.yml. mqtt will be used")
+                    if not 'server' in dict_config['blue_iris_config']['mqtt']:
+                        logger.error("server required within blue_iris_config.mqtt in config.yml")
+                        bool_error = True
+                    if not 'port' in dict_config['blue_iris_config']['mqtt']:
+                        logger.error("port required within blue_iris_config.mqtt in config.yml")
+                        bool_error = True
+                else:
+                    if 'mqtt' in dict_config['blue_iris_config']:
+                        if not 'server' in dict_config['blue_iris_config']['mqtt']:
+                            logger.error("server required within blue_iris_config.mqtt in config.yml")
+                            bool_error = True
+                        if not 'port' in dict_config['blue_iris_config']['mqtt']:
+                            logger.error("port required within blue_iris_config.mqtt in config.yml")
+                            bool_error = True
+                    elif 'api' in dict_config['blue_iris_config']:
+                        if not 'protocol' in dict_config['blue_iris_config']['api']:
+                            logger.error("protocol required within blue_iris_config.api in config.yml")
+                            bool_error = True
+                        if not 'server' in dict_config['blue_iris_config']['api']:
+                            logger.error("server required within blue_iris_config.api in config.yml")
+                            bool_error = True
+                        if not 'port' in dict_config['blue_iris_config']['api']:
+                            logger.error("port required within blue_iris_config.api in config.yml")
+                            bool_error = True
+                        if not 'user' in dict_config['blue_iris_config']['api']:
+                            logger.error("user required within blue_iris_config.api in config.yml")
+                            bool_error = True
+                        if not 'password' in dict_config['blue_iris_config']['api']:
+                            logger.error("password required within blue_iris_config.api in config.yml")
+                            bool_error = True
+                        if not 'use_secure_session_keys' in dict_config['blue_iris_config']['api']:
+                            logger.error("use_secure_session_keys required within blue_iris_config.api in config.yml")
+                            bool_error = True
+                    else:
+                        logger.error("mqtt and\or api not within blue_iris_config.mqtt in config.yml")
+                        bool_error = True
+
+
+        else:
+            logger.error("blue_iris_config is required in config.yml")
+            bool_error = True
+
+        if 'ftp_server' in dict_config:
+            if not 'protocol' in dict_config['ftp_server']['listen_address']:
+                logger.error("listen_address required within ftp_server in config.yml")
+                bool_error = True
+            if not 'server' in dict_config['ftp_server']['listen_port']:
+                logger.error("listen_port required within ftp_server in config.yml")
+                bool_error = True
+            if not 'port' in dict_config['ftp_server']['use_anonymous_user']:
+                logger.error("use_anonymous_user required within ftp_server in config.yml")
+                bool_error = True
+            if 'users' in dict_config['ftp_server']:
+                if len(dict_config['ftp_server']['users']) == 0 and \
+                    dict_config['ftp_server']['use_anonymous_user'] == False:
+                    logger.error("No users configured and use_anonymous_user=False within ftp_server in config.yml")
+                    bool_error = True
+            elif not 'users' in dict_config['ftp_server'] and \
+                    dict_config['ftp_server']['use_anonymous_user'] == False:
+                    logger.error("No users configured and use_anonymous_user=False within ftp_server in config.yml")
+                    bool_error = True
+            if 'users' in dict_config['ftp_server']:
+                for user in dict_config['ftp_server']['users']:
+                    
+
+
+        else:
+            logger.error("ftp_server is required in config.yml")
+            bool_error = True
+    except Exception as e:
+        logger.error("Error checking configuration: {error}".format(error=str(e)))
+        bool_error = True
+    if bool_error:
+        exit(1)
+    else:
+        return True
+
 if __name__ == '__main__':
+    logger.add("logs/AmcrestBlueIrisBroker_{time:YYYYMMDD}.log",
+               enqueue=True,
+               serialize=True,
+               level="DEBUG",
+               rotation="00:00")
     script_dir = os.path.dirname(os.path.realpath(__file__))
     dict_config_info = {}
     dict_cameras = {}
-    with open("config.yml", "r") as stream:
-        try:
-            dict_config_info = yaml.safe_load(stream)
-        except yaml.YAMLError as exc:
-            print(exc)
-
-    bi_trigger = BITrigger(dict_config_info['BlueIrisConfig'])
-    dict_cameras = dict_config_info['cameras']
-    authorizer = DummyAuthorizer()
-    if not dict_config_info['ftp_server']['use_anonymous_user']:
-        for user in dict_config_info['ftp_server']['users']:
-            user = user['user']
-            authorizer.add_user(user['username'], user['password'], '{}/image_dir'.format(script_dir), perm='elradfmwMT')
-    else:
-        authorizer.add_anonymous('{}/image_dir'.format(script_dir), perm='elradfmwMT')
-    address = (dict_config_info['ftp_server']['listen_address'],
-               dict_config_info['ftp_server']['listen_port'])
-    handler = CustomFTPHandler
-    handler.authorizer = authorizer
-    server = servers.FTPServer(address, handler)
-    server.serve_forever()
+    logger.debug("Loading config.yml")
+    try:
+        with open("config.yml", "r") as stream:
+            try:
+                dict_config_info = yaml.safe_load(stream)
+            except yaml.YAMLError as exc:
+                logger.error("Unable to load config.yml: {error}".format(error=str(exec)))
+                exit(1)
+    except Exception as e:
+        logger.error("Unable to load config.yml: {error}".format(error=str(e)))
+        exit(1)
+    logger.debug("config.yml successfully loaded")
+    check_configuration(dict_config_info)
+    # bi_trigger = BITrigger(dict_config_info['blue_iris_config'])
+    # dict_cameras = dict_config_info['cameras']
+    # authorizer = DummyAuthorizer()
+    # if not dict_config_info['ftp_server']['use_anonymous_user']:
+    #     for user in dict_config_info['ftp_server']['users']:
+    #         user = user['user']
+    #         authorizer.add_user(user['username'], user['password'], '{}/image_dir'.format(script_dir), perm='elradfmwMT')
+    # else:
+    #     authorizer.add_anonymous('{}/image_dir'.format(script_dir), perm='elradfmwMT')
+    # address = (dict_config_info['ftp_server']['listen_address'],
+    #            dict_config_info['ftp_server']['listen_port'])
+    # handler = CustomFTPHandler
+    # handler.authorizer = authorizer
+    # server = servers.FTPServer(address, handler)
+    #
+    # server.serve_forever()
 
 

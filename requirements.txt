@@ -2,3 +2,4 @@ pyftpdlib
 pyyaml
 paho-mqtt
 requests
+loguru
